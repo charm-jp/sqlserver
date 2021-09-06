@@ -1,7 +1,9 @@
 package sqlserver
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -21,6 +23,8 @@ type Config struct {
 	DSN               string
 	DefaultStringSize int
 	Conn              gorm.ConnPool
+	ProductVersion    string
+	Edition           string
 }
 
 type Dialector struct {
@@ -58,6 +62,22 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 		}
 	}
 
+	// retrieve the server version to determine if legacy queries should be used
+	var version, edition string
+	err = db.ConnPool.QueryRowContext(context.Background(), "SELECT SERVERPROPERTY('productversion') AS version, SERVERPROPERTY('Edition') AS edition;").Scan(&version, &edition)
+
+	if err != nil {
+		return errors.New(fmt.Sprintf("unable to get server version with error: %s", err.Error()))
+	}
+
+	db.Logger.Info(context.Background(), fmt.Sprintf("found server with version: %s %s", edition, version))
+	dialector.ProductVersion = version
+	dialector.Edition = edition
+
+	if dialector.IsUnsupportedSQLServer() {
+		db.Logger.Warn(context.Background(), fmt.Sprintf("this version of SQL server (%s) is unsupported. some backwards compatability has been implemented but may be incomplete", version))
+	}
+
 	for k, v := range dialector.ClauseBuilders() {
 		db.ClauseBuilders[k] = v
 	}
@@ -65,37 +85,110 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 }
 
 func (dialector Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
-	return map[string]clause.ClauseBuilder{
-		"LIMIT": func(c clause.Clause, builder clause.Builder) {
-			if limit, ok := c.Expression.(clause.Limit); ok {
+	if dialector.IsUnsupportedSQLServer() {
+		return map[string]clause.ClauseBuilder{
+			"FROM": func(c clause.Clause, builder clause.Builder) {
 				if stmt, ok := builder.(*gorm.Statement); ok {
-					if _, ok := stmt.Clauses["ORDER BY"]; !ok {
-						if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
-							builder.WriteString("ORDER BY ")
-							builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
-							builder.WriteByte(' ')
+					if limit, ok := stmt.Clauses["LIMIT"]; ok {
+						// get the current selects and add row number selector
+						builder.WriteString("FROM (")
+						if selects := stmt.Selects; len(selects) > 0 {
+							for _, s := range selects {
+								builder.WriteQuoted(s)
+								builder.WriteByte(',')
+							}
+							builder.WriteString("ROW_NUMBER()")
 						} else {
-							builder.WriteString("ORDER BY (SELECT NULL) ")
+							builder.WriteString("SELECT *, ROW_NUMBER()")
+						}
+
+						builder.WriteString(" OVER (ORDER BY ")
+						if orderBy, ok := stmt.Clauses["ORDER BY"]; ok {
+							ob, _ := orderBy.Expression.(clause.OrderBy)
+							ob.Build(builder)
+						} else {
+							if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
+								builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
+								builder.WriteByte(' ')
+							} else {
+								builder.WriteString("(SELECT NULL) ")
+							}
+						}
+						builder.WriteString(") AS row ")
+						if from, ok := stmt.Clauses["FROM"]; ok {
+							from.Build(builder)
+						} else {
+							builder.WriteString("FROM ")
+							builder.WriteQuoted(stmt.Table)
+						}
+
+						builder.WriteString(") a")
+
+						if limitExpr, ok := limit.Expression.(clause.Limit); ok {
+							var query []string
+							var queryParam []int
+							if limitExpr.Offset > 0 {
+								query = append(query, "row > ?")
+								queryParam = append(queryParam, limitExpr.Offset)
+							}
+
+							if limitExpr.Limit > 0 {
+								query = append(query, "row < ?")
+								if limitExpr.Offset == 0 {
+									queryParam = append(queryParam, limitExpr.Limit)
+								} else {
+									queryParam = append(queryParam, limitExpr.Limit+limitExpr.Offset)
+								}
+							}
+
+							for i := 0; i < len(query); i++ {
+								if conds := stmt.BuildCondition(query[i], queryParam[i]); len(conds) > 0 {
+									stmt.AddClause(clause.Where{conds})
+								}
+							}
 						}
 					}
+				} else {
+					c.Build(builder)
 				}
-
-				if limit.Offset > 0 {
-					builder.WriteString("OFFSET ")
-					builder.WriteString(strconv.Itoa(limit.Offset))
-					builder.WriteString(" ROWS")
-				}
-
-				if limit.Limit > 0 {
-					if limit.Offset == 0 {
-						builder.WriteString("OFFSET 0 ROW")
+			},
+			"LIMIT": func(c clause.Clause, builder clause.Builder) {
+				// handled by the from function
+			},
+		}
+	} else {
+		return map[string]clause.ClauseBuilder{
+			"LIMIT": func(c clause.Clause, builder clause.Builder) {
+				if limit, ok := c.Expression.(clause.Limit); ok {
+					if stmt, ok := builder.(*gorm.Statement); ok {
+						if _, ok := stmt.Clauses["ORDER BY"]; !ok {
+							if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
+								builder.WriteString("ORDER BY ")
+								builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
+								builder.WriteByte(' ')
+							} else {
+								builder.WriteString("ORDER BY (SELECT NULL) ")
+							}
+						}
 					}
-					builder.WriteString(" FETCH NEXT ")
-					builder.WriteString(strconv.Itoa(limit.Limit))
-					builder.WriteString(" ROWS ONLY")
+
+					if limit.Offset > 0 {
+						builder.WriteString("OFFSET ")
+						builder.WriteString(strconv.Itoa(limit.Offset))
+						builder.WriteString(" ROWS")
+					}
+
+					if limit.Limit > 0 {
+						if limit.Offset == 0 {
+							builder.WriteString("OFFSET 0 ROW")
+						}
+						builder.WriteString(" FETCH NEXT ")
+						builder.WriteString(strconv.Itoa(limit.Limit))
+						builder.WriteString(" ROWS ONLY")
+					}
 				}
-			}
-		},
+			},
+		}
 	}
 }
 
@@ -200,4 +293,86 @@ func (dialectopr Dialector) SavePoint(tx *gorm.DB, name string) error {
 func (dialectopr Dialector) RollbackTo(tx *gorm.DB, name string) error {
 	tx.Exec("ROLLBACK TRANSACTION " + name)
 	return nil
+}
+
+type Edition int
+
+const (
+	Enterprise Edition = iota + 1
+	Business
+	Developer
+	Express
+	ExpressAdvanced
+	Standard
+	Web
+	Azure
+	AzureEdge
+	AzureEdgeDeveloper
+	Unknown
+)
+
+func (dialector Dialector) IsUnsupportedSQLServer() bool {
+	if major, _, edition, _, err := dialector.GetVersionAndType(); err == nil && major < 11 && edition < Azure {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (dialector Dialector) GetVersionAndType() (versionMajor int, versionMinor int, edition Edition, is64Bit bool, err error) {
+	if dialector.ProductVersion == "" {
+		return 0, 0, 0, false, errors.New("no product edition provided")
+	}
+
+	if dialector.Edition == "" {
+		return 0, 0, 0, false, errors.New("no product edition provided")
+	}
+
+	versionParts := strings.Split(dialector.ProductVersion, ".")
+	if len(versionParts) > 0 {
+		versionMajor, err = strconv.Atoi(versionParts[0])
+
+		if err != nil {
+			return 0, 0, 0, false, errors.New(fmt.Sprintf("invalid product version with error: %s", err.Error()))
+		}
+	}
+
+	if len(versionParts) > 1 {
+		versionMinor, _ = strconv.Atoi(versionParts[1]) // ignore any errors as the minor isn't hugely important
+	}
+
+	edStr := dialector.Edition
+	is64Identifier := "(64-bit)"
+	if strings.Contains(edStr, is64Identifier) {
+		is64Bit = true
+		edStr = strings.TrimSpace(strings.ReplaceAll(edStr, is64Identifier, ""))
+	}
+
+	// sourced from https://docs.microsoft.com/en-us/sql/t-sql/functions/serverproperty-transact-sq
+	switch edStr {
+	case "Enterprise Edition", "Enterprise Edition: Core-based Licensing", "Enterprise Evaluation Edition":
+		edition = Enterprise
+	case "Business Intelligence Edition":
+		edition = Business
+	case "Developer Edition":
+		edition = Developer
+	case "Express Edition":
+		edition = Express
+	case "Express Edition with Advanced Services":
+		edition = ExpressAdvanced
+	case "Standard Edition":
+		edition = Standard
+	case "Web Edition":
+		edition = Web
+	case "SQL Azure":
+		edition = Azure
+	case "Azure SQL Edge":
+		edition = AzureEdge
+	case "Azure SQL Edge Developer":
+		edition = AzureEdgeDeveloper
+	default:
+		edition = Unknown
+	}
+
+	return versionMajor, versionMinor, edition, is64Bit, nil
 }
