@@ -86,76 +86,7 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 
 func (dialector Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
 	if dialector.IsUnsupportedSQLServer() {
-		return map[string]clause.ClauseBuilder{
-			"FROM": func(c clause.Clause, builder clause.Builder) {
-				if stmt, ok := builder.(*gorm.Statement); ok {
-					if limit, ok := stmt.Clauses["LIMIT"]; ok {
-						// get the current selects and add row number selector
-						builder.WriteString("FROM (")
-						if selects := stmt.Selects; len(selects) > 0 {
-							for _, s := range selects {
-								builder.WriteQuoted(s)
-								builder.WriteByte(',')
-							}
-							builder.WriteString("ROW_NUMBER()")
-						} else {
-							builder.WriteString("SELECT *, ROW_NUMBER()")
-						}
-
-						builder.WriteString(" OVER (ORDER BY ")
-						if orderBy, ok := stmt.Clauses["ORDER BY"]; ok {
-							ob, _ := orderBy.Expression.(clause.OrderBy)
-							ob.Build(builder)
-						} else {
-							if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
-								builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
-								builder.WriteByte(' ')
-							} else {
-								builder.WriteString("(SELECT NULL) ")
-							}
-						}
-						builder.WriteString(") AS row ")
-						if from, ok := stmt.Clauses["FROM"]; ok {
-							from.Build(builder)
-						} else {
-							builder.WriteString("FROM ")
-							builder.WriteQuoted(stmt.Table)
-						}
-
-						builder.WriteString(") a")
-
-						if limitExpr, ok := limit.Expression.(clause.Limit); ok {
-							var query []string
-							var queryParam []int
-							if limitExpr.Offset > 0 {
-								query = append(query, "row > ?")
-								queryParam = append(queryParam, limitExpr.Offset)
-							}
-
-							if limitExpr.Limit > 0 {
-								query = append(query, "row < ?")
-								if limitExpr.Offset == 0 {
-									queryParam = append(queryParam, limitExpr.Limit)
-								} else {
-									queryParam = append(queryParam, limitExpr.Limit+limitExpr.Offset)
-								}
-							}
-
-							for i := 0; i < len(query); i++ {
-								if conds := stmt.BuildCondition(query[i], queryParam[i]); len(conds) > 0 {
-									stmt.AddClause(clause.Where{conds})
-								}
-							}
-						}
-					}
-				} else {
-					c.Build(builder)
-				}
-			},
-			"LIMIT": func(c clause.Clause, builder clause.Builder) {
-				// handled by the from function
-			},
-		}
+		return dialector.getUnsupportedClauses()
 	} else {
 		return map[string]clause.ClauseBuilder{
 			"LIMIT": func(c clause.Clause, builder clause.Builder) {
@@ -375,4 +306,117 @@ func (dialector Dialector) GetVersionAndType() (versionMajor int, versionMinor i
 	}
 
 	return versionMajor, versionMinor, edition, is64Bit, nil
+}
+
+func (Dialector) getUnsupportedClauses() map[string]clause.ClauseBuilder {
+	return map[string]clause.ClauseBuilder{
+		"SELECT": func(c clause.Clause, builder clause.Builder) {
+			builder.WriteString("SELECT ")
+
+			limit, offset, err := getLimitAndOffsetIfExists(builder)
+
+			if err == nil {
+				if offset == 0 {
+					builder.WriteString(fmt.Sprintf("TOP(%d) ", limit))
+				}
+			}
+
+			c.Expression.(clause.Select).Build(builder)
+		},
+		// due to legacy mssql syntax not having native support for offsets, a composite query is required.
+		// this FROM clause wraps the LIMIT and ORDER BY clauses around original request which becomes a subquery
+		"FROM": func(c clause.Clause, builder clause.Builder) {
+			builder.WriteString("FROM ")
+			if stmt, ok := builder.(*gorm.Statement); ok {
+				limit, offset, err := getLimitAndOffsetIfExists(builder)
+
+				if err == nil {
+					// check whether we require offsetting
+					if offset > 0 {
+						// get the current selects and add row number selector
+						builder.WriteString("(")
+						if selects := stmt.Selects; len(selects) > 0 {
+							for _, s := range selects {
+								builder.WriteQuoted(s)
+								builder.WriteByte(',')
+							}
+							builder.WriteString("ROW_NUMBER()")
+						} else {
+							builder.WriteString("SELECT *, ROW_NUMBER()")
+						}
+
+						builder.WriteString(" OVER (ORDER BY ")
+						if orderBy, ok := stmt.Clauses["ORDER BY"]; ok {
+							ob, _ := orderBy.Expression.(clause.OrderBy)
+							ob.Build(builder)
+						} else {
+							if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
+								builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
+								builder.WriteByte(' ')
+							} else {
+								builder.WriteString("(SELECT NULL) ")
+							}
+						}
+						builder.WriteString(") AS row ")
+						if from, ok := stmt.Clauses["FROM"]; ok {
+							from.Build(builder)
+						} else {
+							builder.WriteString("FROM ")
+							builder.WriteQuoted(stmt.Table)
+						}
+
+						builder.WriteString(") a")
+
+						var query []string
+						var queryParam []int
+						if offset > 0 {
+							query = append(query, "row > ?")
+							queryParam = append(queryParam, offset)
+						}
+
+						if limit > 0 {
+							query = append(query, "row <= ?")
+							if offset == 0 {
+								queryParam = append(queryParam, limit)
+							} else {
+								queryParam = append(queryParam, limit+offset)
+							}
+						}
+
+						for i := 0; i < len(query); i++ {
+							if conds := stmt.BuildCondition(query[i], queryParam[i]); len(conds) > 0 {
+								stmt.AddClause(clause.Where{conds})
+							}
+						}
+
+						return
+					}
+				}
+			}
+
+			c.Expression.(clause.From).Build(builder)
+		},
+		"LIMIT": func(c clause.Clause, builder clause.Builder) {
+			// handled by the from function
+		},
+		"ORDER BY": func(c clause.Clause, builder clause.Builder) {
+			// handled by the from function when offsetting. if not, handle it here
+			if _, offset, err := getLimitAndOffsetIfExists(builder); offset == 0 || err != nil {
+				builder.WriteString("ORDER BY ")
+				c.Expression.(clause.OrderBy).Build(builder)
+			}
+		},
+	}
+}
+
+func getLimitAndOffsetIfExists(builder clause.Builder) (limit, offset int, err error) {
+	if stmt, ok := builder.(*gorm.Statement); ok {
+		if limit, ok := stmt.Clauses["LIMIT"]; ok {
+			if limitExpr, ok := limit.Expression.(clause.Limit); ok {
+				return limitExpr.Limit, limitExpr.Offset, nil
+			}
+		}
+	}
+
+	return 0, 0, errors.New("no limit / offset found")
 }
